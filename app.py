@@ -1,6 +1,7 @@
 # app.py - Interface Streamlit do Agente Financeiro
 
 import os
+import io
 import time
 import pandas as pd
 import plotly.express as px
@@ -178,10 +179,9 @@ def init_session():
         st.session_state.agent_state = get_initial_state()
     if "graph" not in st.session_state:
         api_key = st.session_state.get("gemini_api_key", os.getenv("GOOGLE_API_KEY", ""))
-        if api_key:
-            st.session_state.graph = build_graph(api_key)
-        else:
-            st.session_state.graph = None
+        os.environ["GOOGLE_API_KEY"] = api_key
+        os.environ['GEMINI_API_KEY'] = api_key
+        st.session_state.graph = build_graph()
     if "display_messages" not in st.session_state:
         st.session_state.display_messages = []
     if "charts" not in st.session_state:
@@ -195,11 +195,15 @@ def render_chart(chart_data: dict):
     data = chart_data.get("data", [])
     if not data:
         return
+    if not config.get('relevant'):
+        return False
 
-    df = pd.DataFrame(data)
+    print(chart_data)
+    df = pd.read_csv(io.StringIO(data))
+    print(df)
     chart_type = config.get("type", "bar")
-    x_col = config.get("x")
-    y_col = config.get("y")
+    x_col = config.get("x_axis")
+    y_col = config.get("y_axis")
     title = config.get("title", "Gráfico")
 
     # Fallback de colunas
@@ -236,22 +240,7 @@ def render_chart(chart_data: dict):
 
 def render_sidebar():
     with st.sidebar:
-        st.markdown("## 💼 FinAgent")
-        st.markdown("---")
-
-        # API Key
-        api_key_input = st.text_input(
-            "🔑 Gemini API Key",
-            type="password",
-            value=st.session_state.get("gemini_api_key", os.getenv("GEMINI_API_KEY", "")),
-            placeholder="AIza...",
-            help="Insira sua chave da API do Google Gemini",
-        )
-        if api_key_input != st.session_state.get("gemini_api_key", ""):
-            st.session_state.gemini_api_key = api_key_input
-            st.session_state.graph = build_graph(api_key_input) if api_key_input else None
-
-        st.markdown("---")
+        st.markdown("#### 💼 FinAgent")
 
         # Status
         state = st.session_state.agent_state
@@ -307,45 +296,46 @@ def render_chat():
         if state.get("authenticated"):
             st.markdown('<div style="text-align:right;padding-top:12px"><span class="status-auth">✓ Autenticado</span></div>', unsafe_allow_html=True)
 
-    st.markdown("---")
-
     # Mensagens
     msgs = st.session_state.display_messages
     charts = st.session_state.charts
 
-    if not msgs:
-        st.markdown("""
-        <div style="text-align:center;padding:60px 20px;color:#4a5568">
-            <div style="font-size:3rem">💼</div>
-            <h3 style="color:#6b7280;font-weight:400">Bem-vindo ao FinAgent</h3>
-            <p>Seu assistente financeiro pessoal com IA.<br>
-            Envie uma mensagem para começar.</p>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        chart_idx = 0
-        l = len(msgs) - 1
-        for i, msg in enumerate(msgs):
-            if msg["role"] == "user":
-                message = st.chat_message(name='user')
-                message.write(msg['content'])
-            else:
-                message = st.chat_message(name='assistant')
-                if (i == l) and st.session_state.get('stream_response'):
-                    message.write_stream(map(lambda x: delay(x) + ' ',msg['content'].split()))
-                    st.session_state.stream_response = False
+    chat_container = st.container(height=400)
+    with chat_container:
+        if not msgs:
+            st.markdown("""
+            <div style="text-align:center;padding:60px 20px;color:#4a5568">
+                <div style="font-size:3rem">💼</div>
+                <h3 style="color:#6b7280;font-weight:400">Bem-vindo ao FinAgent</h3>
+                <p>Seu assistente financeiro pessoal com IA.<br>
+                Envie uma mensagem para começar.</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            chart_idx = 0
+            l = len(msgs) - 1
+            for i, msg in enumerate(msgs):
+                if msg["role"] == "user":
+                    message = st.chat_message(name='user')
+                    message.text(msg['content'])
                 else:
-                    message.write(msg['content'])
+                    message = st.chat_message(name='assistant')
+                    if (i == l) and st.session_state.get('stream_response'):
+                        message.write_stream(map(lambda x: delay(x) + ' ',msg['content'].replace('$','\$').split()))
+                        st.session_state.stream_response = False
+                    else:
+                        message.write(msg['content'].replace('$','\$'))
 
-                # Renderiza gráfico se associado a esta mensagem
-                if msg.get("has_chart") and chart_idx < len(charts):
-                    render_chart(charts[chart_idx])
-                    chart_idx += 1
+                    # Renderiza gráfico se associado a esta mensagem
+                    if msg.get("has_chart") and chart_idx < len(charts):
+                        render_chart(charts[chart_idx])
+                        chart_idx += 1
+    return chat_container
 
 
 # ─── Input area ──────────────────────────────────────────────────────────────
 
-def handle_input(user_input: str):
+def handle_input(user_input: str, chat_container):
     if not user_input.strip():
         return
 
@@ -362,7 +352,7 @@ def handle_input(user_input: str):
     current_state["messages"] = current_state["messages"] + [HumanMessage(content=user_input)]
 
     # Invoca o grafo
-    with st.spinner("Pensando..."):
+    with chat_container.spinner("Pensando..."):
         result = graph.invoke(current_state)
 
     # Atualiza estado
@@ -396,17 +386,15 @@ def main():
     # Layout principal
     main_col, _ = st.columns([1, 0.001])
     with main_col:
-        render_chat()
-
-        st.markdown("---")
+        chat_container = render_chat()
 
         # Atalho de shortcut
         if "shortcut_prompt" in st.session_state:
             prompt = st.session_state.pop("shortcut_prompt")
-            message = st.chat_message(name='user')
+            message = chat_container.chat_message(name='user')
             message.write(prompt)
             st.session_state.stream_response = True
-            handle_input(prompt)
+            handle_input(prompt,chat_container)
             st.rerun()
 
         # Input do usuário
@@ -416,15 +404,15 @@ def main():
         )
         # Processa input
         if user_input:
-            message = st.chat_message(name='user')
+            message = chat_container.chat_message(name='user')
             message.write(user_input)
             st.session_state.stream_response = True
-            handle_input(user_input)
+            handle_input(user_input,chat_container)
             st.rerun()
 
-        # Enter para enviar (JS workaround via session)
-        if user_input and st.session_state.get("_last_input") != user_input:
-            st.session_state["_last_input"] = user_input
+        # # Enter para enviar (JS workaround via session)
+        # if user_input and st.session_state.get("_last_input") != user_input:
+        #     st.session_state["_last_input"] = user_input
 
 
 if __name__ == "__main__":
