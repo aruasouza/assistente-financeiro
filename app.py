@@ -191,12 +191,10 @@ def init_session():
 # ─── Chart renderer ───────────────────────────────────────────────────────────
 
 def render_chart(chart_data: dict):
-    config = chart_data.get("config", {})
+    config = chart_data.get("config").model_dump()
     data = chart_data.get("data", [])
     if not data:
         return
-    if not config.get('relevant'):
-        return False
 
     print(chart_data)
     df = pd.read_csv(io.StringIO(data))

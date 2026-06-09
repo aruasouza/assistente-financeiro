@@ -5,13 +5,10 @@ import os
 import re
 from datetime import date
 from typing import Annotated, Any, TypedDict
-from outputs import UsuarioExiste
-
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import create_react_agent
 
 from categories import ALL_CATEGORIES, EXPENSE_CATEGORIES, INCOME_CATEGORIES
 from database import (
@@ -19,7 +16,8 @@ from database import (
     get_schema,
     register_user,
 )
-from tools import build_record_tool, build_sql_tool, responder_usuario
+from tools import build_record_tool, build_sql_tool
+from outputs import Resposta, UsuarioExiste
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
@@ -152,7 +150,13 @@ def register_node(state: AgentState) -> dict:
 
 
 def financial_node(state: AgentState) -> dict:
-    """Nó principal para usuários autenticados."""
+    """Nó principal para usuários autenticados.
+
+    Fluxo de duas chamadas ao LLM:
+      1ª — tool_calling: o modelo decide quais ferramentas acionar (registro ou SQL).
+      2ª — structured_output: com os resultados das tools anexados, gera a Resposta final.
+    Isso garante exatamente dois round-trips ao LLM, minimizando latência.
+    """
     username = state["username"]
     schema = get_schema(username)
     system_prompt = FINANCIAL_SYSTEM.format(
@@ -161,35 +165,47 @@ def financial_node(state: AgentState) -> dict:
         income_cats=", ".join(INCOME_CATEGORIES),
         today=date.today().isoformat(),
     )
-    agent = create_react_agent(
-        name="assistente-financeiro",
-        model = ChatGoogleGenerativeAI(
-            model="gemini-3.1-flash-lite",
-            temperature=0.3,
-        ),
-        tools=[build_record_tool(username),build_sql_tool(username),responder_usuario],
-    )
-    input = state.copy()
-    input["messages"].insert(0, SystemMessage(content=system_prompt))
-    response = agent.invoke(input)
-    for msg in reversed(response["messages"]):
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tool_call in msg.tool_calls:
-                if tool_call["name"] == "responder_usuario":
-                    resposta_estruturada = tool_call["args"]["resposta"]
-                    break
-    chart = resposta_estruturada.get('chart')
-    data = resposta_estruturada.get('chart_data')
-    response_text = resposta_estruturada.get('content')
-    if chart is not None:
+
+    # Ferramentas disponíveis na 1ª chamada (registro e consulta SQL)
+    record_tool = build_record_tool(username)
+    sql_tool = build_sql_tool(username)
+    action_tools = {t.name: t for t in [record_tool, sql_tool]}
+
+    llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0.3)
+
+    # ── 1ª chamada: tool_calling ──────────────────────────────────────────────
+    llm_with_tools = llm.bind_tools(list(action_tools.values()))
+    messages_1a_chamada = [SystemMessage(content=system_prompt)] + state["messages"]
+    ai_msg = llm_with_tools.invoke(messages_1a_chamada)
+
+    # ── Execução das tools ────────────────────────────────────────────────────
+    tool_results: list[ToolMessage] = []
+    for call in ai_msg.tool_calls or []:
+        tool = action_tools.get(call["name"])
+        if tool is None:
+            result = f"Ferramenta '{call['name']}' não encontrada."
+        else:
+            try:
+                result = tool.invoke(call["args"])
+            except Exception as e:
+                result = f"Erro ao executar '{call['name']}': {e}"
+        tool_results.append(
+            ToolMessage(content=str(result), tool_call_id=call["id"])
+        )
+
+    # ── 2ª chamada: structured_output ────────────────────────────────────────
+    llm_structured = llm.with_structured_output(Resposta)
+    messages_2a_chamada = messages_1a_chamada + [ai_msg] + tool_results
+    resposta: Resposta = llm_structured.invoke(messages_2a_chamada)
+
+    # ── Monta retorno do nó ───────────────────────────────────────────────────
+    chart = resposta.chart
+    if chart is not None and chart.relevant:
         return {
-            "messages": [AIMessage(content=response_text)], "chart_request": {
-                "config": chart,
-                "data": data
-            }
+            "messages": [AIMessage(content=resposta.content)],
+            "chart_request": {"config": chart, "data": resposta.chart_data},
         }
-    else:
-        return {"messages": [AIMessage(content=response_text)], "chart_request": None}
+    return {"messages": [AIMessage(content=resposta.content)], "chart_request": None}
 
 
 # ─── Router ───────────────────────────────────────────────────────────────────
