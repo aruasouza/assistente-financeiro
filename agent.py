@@ -60,7 +60,7 @@ def auth_node(state: AgentState) -> dict:
     """Gerencia o fluxo de autenticação e cadastro."""
     if state['first_interaction']:
         return {
-            "messages": [AIMessage(content="👋 Olá! Para acessar seu assistente financeiro, informe seu **nome de usuário** (ou diga que não tem cadastro para criar um):")],
+            "messages": [AIMessage(content='👋 Olá! Para acessar seu assistente financeiro, informe seu **nome de usuário** (ou diga: "Não tenho cadastro" para criar um):')],
             'first_interaction': False
         }
     messages = state["messages"]
@@ -72,24 +72,18 @@ def auth_node(state: AgentState) -> dict:
 
     lower = last_user_msg.lower()
     if state.get('username') is None:
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-3.1-flash-lite",
-            temperature=0.0,
-        )
-        llm_estruturado = llm.with_structured_output(UsuarioExiste)
-        resp = llm_estruturado.invoke(state['messages'])
-        if resp.new_user:
+        if (lower == 'não tenho cadastro') or (lower == 'nao tenho cadastro'):
             return {
                 "register_pending": True,
                 "messages": [AIMessage(content="Vamos criar seu cadastro!\nQual será o seu nome de usuário?")]
             }            
-        if 'username' in resp.model_fields_set:
+        elif re.match(r'^[a-z0-9_]{3,20}$', last_user_msg):
             return {
                 "messages": [AIMessage(content="Agora digite sua senha:")],
-                "username": resp.username,
+                "username": last_user_msg,
             }
         return {
-                "messages": [AIMessage(content="Por favor, informe seu nome de usuário para continuar.")],
+                "messages": [AIMessage(content="Por favor, informe um nome de usuário válido para continuar. Utilize apenas letras minúsculas, números e '_'.")],
             }
     if state.get('username'):
         username = state['username']
